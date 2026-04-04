@@ -11,14 +11,16 @@ delete process.env.HTTP_PROXY
 delete process.env.HTTPS_PROXY
 
 const certDir = path.resolve(__dirname, '../certs')
+const certPath = path.join(certDir, 'cert.pem')
+const keyPath = path.join(certDir, 'key.pem')
+const httpsConfig = fs.existsSync(certPath) && fs.existsSync(keyPath)
+  ? { key: fs.readFileSync(keyPath), cert: fs.readFileSync(certPath) }
+  : undefined
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
-    https: {
-      key: fs.readFileSync(path.join(certDir, 'key.pem')),
-      cert: fs.readFileSync(path.join(certDir, 'cert.pem')),
-    },
+    https: httpsConfig,
     proxy: {
       '/api': {
         target: 'http://localhost:18923',
