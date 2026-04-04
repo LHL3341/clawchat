@@ -11,6 +11,7 @@ from services.agent_chat import generate_agent_reply, generate_opening, parse_ha
 from services.affinity import evaluate_affinity
 from services.host_knowledge import get_host_knowledge, format_host_knowledge_context
 from services.llm import get_model, chat_completion, chat_completion_json
+from services.helpers import is_bot, get_existing_handoffs, format_recent_history, handle_reply_with_handoff
 import json
 import asyncio
 
@@ -129,8 +130,7 @@ async def send_message(
     elif data.sender_type == "human":
         # Human mode: if the OTHER shrimp is a test bot (no user account), auto-reply
         other_id = conv.shrimp_b_id if sender_id == conv.shrimp_a_id else conv.shrimp_a_id
-        is_bot = (await db.execute(select(User).where(User.shrimp_id == other_id))).scalar_one_or_none() is None
-        if is_bot:
+        if await is_bot(db, other_id):
             asyncio.create_task(_auto_reply_bot(conversation_id, other_id))
 
     return msg
@@ -168,55 +168,13 @@ async def _auto_reply_bot(conversation_id: str, responder_id: str):
             instructions = [m.content for m in history if m.sender_type == SenderType.instruction.value and m.sender_id == responder_id]
 
             # Load existing handoffs to avoid repeats
-            inv_result = await db.execute(
-                select(Invitation).where(Invitation.conversation_id == conversation_id)
-            )
-            existing_handoffs = [
-                f"[{inv.handoff_type}] {inv.content}" for inv in inv_result.scalars().all()
-            ] or None
+            existing_handoffs = await get_existing_handoffs(db, conversation_id)
 
             hk = await get_host_knowledge(db, responder_id)
             hk_ctx = format_host_knowledge_context(hk)
             used_model = get_model(speaker.preferred_model or None)
             reply_text = await generate_agent_reply(speaker, listener, history, instructions[-3:] if instructions else None, existing_handoffs=existing_handoffs, host_knowledge_context=hk_ctx, model=speaker.preferred_model or None)
-            reply_text, handoff_type, handoff_desc = parse_handoff_tag(reply_text)
-
-            is_bot_sender = (await db.execute(select(User).where(User.shrimp_id == responder_id))).scalar_one_or_none() is None
-
-            if handoff_type and not is_bot_sender:
-                # Real user's shrimp triggered HANDOFF — block reply, store as draft for host
-                inv = Invitation(
-                    sender_id=responder_id,
-                    receiver_id=listener_id,
-                    conversation_id=conversation_id,
-                    content=handoff_desc or handoff_type,
-                    handoff_type=handoff_type,
-                    draft_reply=reply_text,
-                )
-                db.add(inv)
-                await db.commit()
-                await db.refresh(inv)
-                await broadcast(conversation_id, {
-                    "type": "invitation",
-                    "data": InvitationOut.model_validate(inv).model_dump(mode="json"),
-                })
-            else:
-                # Bot triggered HANDOFF — ignore it (the other side's shrimp will detect it)
-                # Or no HANDOFF — send reply normally
-                reply = Message(
-                    conversation_id=conversation_id,
-                    sender_id=responder_id,
-                    content=reply_text,
-                    sender_type=SenderType.agent.value,
-                    model_used=used_model,
-                )
-                db.add(reply)
-                await db.commit()
-                await db.refresh(reply)
-                await broadcast(conversation_id, {
-                    "type": "message",
-                    "data": MessageOut.model_validate(reply).model_dump(mode="json"),
-                })
+            await handle_reply_with_handoff(db, conversation_id, responder_id, listener_id, reply_text, used_model)
     except Exception as e:
         import logging
         logging.getLogger("chat").error(f"Bot auto-reply error: {e}")
@@ -279,12 +237,7 @@ async def trigger_agent_reply(
     ]
 
     # Load existing handoffs to avoid repeats
-    inv_result = await db.execute(
-        select(Invitation).where(Invitation.conversation_id == conversation_id)
-    )
-    existing_handoffs = [
-        f"[{inv.handoff_type}] {inv.content}" for inv in inv_result.scalars().all()
-    ] or None
+    existing_handoffs = await get_existing_handoffs(db, conversation_id)
 
     hk = await get_host_knowledge(db, speaker.id)
     hk_ctx = format_host_knowledge_context(hk)
@@ -322,8 +275,7 @@ async def trigger_agent_reply(
 
     # Create handoff event only if sender has a real host
     if handoff_type:
-        is_bot_sender = (await db.execute(select(User).where(User.shrimp_id == responder_id))).scalar_one_or_none() is None
-        if not is_bot_sender:
+        if not await is_bot(db, responder_id):
             # Real user's shrimp triggered HANDOFF — pending for host
             inv = Invitation(
                 conversation_id=conversation_id,
@@ -420,54 +372,12 @@ async def websocket_endpoint(websocket: WebSocket, conversation_id: str, token: 
                                 select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at)
                             )
                             history = list(result.scalars().all())
-                            # Load existing handoffs to avoid repeats
-                            inv_result = await db.execute(
-                                select(Invitation).where(Invitation.conversation_id == conversation_id)
-                            )
-                            ws_existing_handoffs = [
-                                f"[{inv.handoff_type}] {inv.content}" for inv in inv_result.scalars().all()
-                            ] or None
+                            ws_existing_handoffs = await get_existing_handoffs(db, conversation_id)
                             ws_hk = await get_host_knowledge(db, responder_id)
                             ws_hk_ctx = format_host_knowledge_context(ws_hk)
                             ws_used_model = get_model(responder.preferred_model or None)
                             reply_text = await generate_agent_reply(responder, listener, history, existing_handoffs=ws_existing_handoffs, host_knowledge_context=ws_hk_ctx, model=responder.preferred_model or None)
-                            reply_text, ws_handoff_type, ws_handoff_desc = parse_handoff_tag(reply_text)
-
-                            ws_is_bot_sender = (await db.execute(select(User).where(User.shrimp_id == responder_id))).scalar_one_or_none() is None
-
-                            if ws_handoff_type and not ws_is_bot_sender:
-                                # Block reply, store draft for host
-                                ws_inv = Invitation(
-                                    sender_id=responder_id,
-                                    receiver_id=payload["sender_id"],
-                                    conversation_id=conversation_id,
-                                    content=ws_handoff_desc or ws_handoff_type,
-                                    handoff_type=ws_handoff_type,
-                                    draft_reply=reply_text,
-                                )
-                                db.add(ws_inv)
-                                await db.commit()
-                                await db.refresh(ws_inv)
-                                await broadcast(conversation_id, {
-                                    "type": "invitation",
-                                    "data": InvitationOut.model_validate(ws_inv).model_dump(mode="json"),
-                                })
-                            else:
-                                # Bot sender: ignore HANDOFF (other side will detect), send reply normally
-                                reply = Message(
-                                    conversation_id=conversation_id,
-                                    sender_id=responder_id,
-                                    content=reply_text,
-                                    sender_type=SenderType.agent.value,
-                                    model_used=ws_used_model,
-                                )
-                                db.add(reply)
-                                await db.commit()
-                                await db.refresh(reply)
-                                await broadcast(conversation_id, {
-                                    "type": "message",
-                                    "data": MessageOut.model_validate(reply).model_dump(mode="json"),
-                                })
+                            await handle_reply_with_handoff(db, conversation_id, responder_id, payload["sender_id"], reply_text, ws_used_model)
     except WebSocketDisconnect:
         active_connections[conversation_id].remove(websocket)
         if not active_connections[conversation_id]:
@@ -639,10 +549,7 @@ async def polish_message(
         .order_by(Message.created_at.desc()).limit(5)
     )
     recent = list(reversed(list(result.scalars().all())))
-    history_text = "\n".join(
-        f"{'我' if m.sender_id == sender_id else listener.name}: {m.content}"
-        for m in recent if m.sender_type != "instruction"
-    )
+    history_text = format_recent_history(recent, sender_id, listener.name)
 
     from prompts.profile import build_shrimp_profile
     system = (
@@ -681,10 +588,7 @@ async def suggest_replies(
         .order_by(Message.created_at.desc()).limit(6)
     )
     recent = list(reversed(list(result.scalars().all())))
-    history_text = "\n".join(
-        f"{'我' if m.sender_id == sender_id else listener.name}: {m.content}"
-        for m in recent if m.sender_type != "instruction"
-    )
+    history_text = format_recent_history(recent, sender_id, listener.name)
 
     from prompts.profile import build_shrimp_profile
     system = (
@@ -827,10 +731,7 @@ async def accept_invitation(inv_id: str, body: dict = None, db: AsyncSession = D
             .order_by(Message.created_at.desc()).limit(5)
         )
         recent = list(reversed(list(result.scalars().all())))
-        history_text = "\n".join(
-            f"{'我' if m.sender_id == inv.sender_id else (listener.name if listener else '对方')}: {m.content}"
-            for m in recent if m.sender_type != "instruction"
-        )
+        history_text = format_recent_history(recent, inv.sender_id, listener.name if listener else '对方')
         from prompts.profile import build_shrimp_profile
         polish_system = (
             f"你是「{sender.name}」的语言润色助手。\n"

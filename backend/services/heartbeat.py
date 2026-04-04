@@ -9,7 +9,8 @@ from sqlalchemy import select, and_, or_
 from database import async_session
 from models import Shrimp, Conversation, Message, ConversationStatus, SenderType, HeartbeatLog, Invitation, User, now_beijing
 from services.matching import match_score, haversine_km, virtual_bot_coords
-from services.agent_chat import generate_agent_reply, generate_opening, parse_handoff_tag
+from services.agent_chat import generate_agent_reply, generate_opening
+from services.helpers import is_bot, get_existing_handoffs, handle_reply_with_handoff
 from services.affinity import evaluate_affinity
 from services.llm import chat_completion_json
 from prompts.memory import get_memory_context, extract_and_update_memory
@@ -211,8 +212,7 @@ async def manual_heartbeat(user_shrimp_id: str):
 
             # Step 2: if we sent a message and the other is a test bot, auto-reply
             if action in ("reply", "follow_up"):
-                is_bot = (await db.execute(select(User).where(User.shrimp_id == other.id))).scalar_one_or_none() is None
-                if is_bot:
+                if await is_bot(db, other.id):
                     try:
                         await _reply_in_conversation(db, other, user, conv.id)
                     except Exception as e:
@@ -409,8 +409,7 @@ async def discovery_heartbeat(user_shrimp_id: str, max_distance: float = 50.0, c
                 await _broadcast_msg(conv.id, msg)
 
                 # If the other side is a test bot (no user account), auto-reply
-                is_bot = (await db.execute(select(User).where(User.shrimp_id == other.id))).scalar_one_or_none() is None
-                if is_bot:
+                if await is_bot(db, other.id):
                     try:
                         await _reply_in_conversation(db, other, user, conv.id)
                     except Exception as e:
@@ -582,12 +581,7 @@ async def _reply_in_conversation(db, speaker: Shrimp, listener: Shrimp, conv_id:
     hk_ctx = format_host_knowledge_context(hk)
 
     # Load existing handoffs for this conversation to avoid repeats
-    inv_result = await db.execute(
-        select(Invitation).where(Invitation.conversation_id == conv_id)
-    )
-    existing_handoffs = [
-        f"[{inv.handoff_type}] {inv.content}" for inv in inv_result.scalars().all()
-    ] or None
+    existing_handoffs = await get_existing_handoffs(db, conv_id)
 
     reply_text, reply_llm = await generate_agent_reply(
         speaker, listener, history,
@@ -603,49 +597,15 @@ async def _reply_in_conversation(db, speaker: Shrimp, listener: Shrimp, conv_id:
         logger.warning(f"{speaker.name} generated empty reply, skipping")
         return None
 
-    # Parse [HANDOFF: type | desc] tag
-    reply_text, handoff_type, handoff_desc = parse_handoff_tag(reply_text)
+    # Handle handoff tag parsing, message/invitation creation, and broadcast
+    reply = await handle_reply_with_handoff(db, conv_id, speaker.id, listener.id, reply_text, used_model)
 
-    # If HANDOFF detected and sender has a real host, BLOCK the reply — store as draft
-    is_bot_sender = (await db.execute(select(User).where(User.shrimp_id == speaker.id))).scalar_one_or_none() is None
-
-    if handoff_type and not is_bot_sender:
-        # Don't send reply, create handoff with draft for host to review
-        inv = Invitation(
-            conversation_id=conv_id,
-            sender_id=speaker.id,
-            receiver_id=listener.id,
-            content=handoff_desc or handoff_type,
-            handoff_type=handoff_type,
-            draft_reply=reply_text,
-        )
-        db.add(inv)
-        await db.commit()
-        await db.refresh(inv)
-        logger.info(f"HANDOFF blocked: {speaker.name} -> {listener.name}: [{handoff_type}] draft='{reply_text[:60]}'")
-        from schemas import InvitationOut
-        await _broadcast_event(conv_id, {
-            "type": "invitation",
-            "data": InvitationOut.model_validate(inv).model_dump(mode="json"),
-        })
+    if reply is None:
+        # Handoff was triggered, message blocked as draft for host review
+        logger.info(f"HANDOFF blocked: {speaker.name} -> {listener.name}")
         return reply_text  # return for logging but message NOT sent
 
-    # Normal send (no handoff, or bot sender auto-resolves)
-    reply = Message(
-        conversation_id=conv_id,
-        sender_id=speaker.id,
-        content=reply_text,
-        sender_type=SenderType.agent.value,
-        model_used=used_model,
-    )
-    db.add(reply)
-    await db.commit()
-    await db.refresh(reply)
-    logger.info(f"{speaker.name} -> {listener.name}: {reply_text[:60]}")
-    await _broadcast_msg(conv_id, reply)
-
-    # Bot sender with handoff: ignore it — the other side's shrimp will detect and trigger HANDOFF for its own host
-    # No invitation created for bot senders
+    logger.info(f"{speaker.name} -> {listener.name}: {reply.content[:60]}")
 
     # Periodically: evaluate affinity + extract memory
     msg_count = len(history) + 1
@@ -804,8 +764,7 @@ async def global_match_heartbeat(user_shrimp_id: str):
                 await db.commit()
                 await _broadcast_msg(conv.id, msg)
 
-                is_bot = (await db.execute(select(User).where(User.shrimp_id == other.id))).scalar_one_or_none() is None
-                if is_bot:
+                if await is_bot(db, other.id):
                     try:
                         await _reply_in_conversation(db, other, user, conv.id)
                     except Exception as e:
