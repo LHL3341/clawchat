@@ -12,7 +12,7 @@ from services.matching import match_score, haversine_km, virtual_bot_coords
 from services.agent_chat import generate_agent_reply, generate_opening
 from services.helpers import is_bot, get_existing_handoffs, handle_reply_with_handoff
 from services.affinity import evaluate_affinity
-from services.llm import chat_completion_json
+from services.llm import chat_completion_json, get_model
 from prompts.memory import get_memory_context, extract_and_update_memory
 from prompts.profile import build_shrimp_profile
 from services.host_knowledge import get_host_knowledge, format_host_knowledge_context
@@ -188,7 +188,7 @@ async def manual_heartbeat(user_shrimp_id: str):
             decision, raw_output = await chat_completion_json([
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": "请决定你要做什么，返回JSON。"},
-            ], model="gpt-5", return_raw=True)
+            ], model=get_model(user.preferred_model or None), return_raw=True)
 
             action = decision.get("action", "skip")
             reason = decision.get("reason", "")

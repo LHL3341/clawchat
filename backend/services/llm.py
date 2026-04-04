@@ -1,6 +1,9 @@
 from openai import AsyncOpenAI
 import os
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 client = AsyncOpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
@@ -42,12 +45,16 @@ async def chat_completion(messages: list[dict], model: str | None = None) -> str
     if system_parts and not merged:
         merged.append({"role": "user", "content": "\n\n".join(system_parts)})
 
-    resp = await client.chat.completions.create(
-        model=model,
-        messages=merged,
-        temperature=1.0,
-        max_completion_tokens=4096,
-    )
+    try:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=merged,
+            temperature=1.0,
+            max_completion_tokens=4096,
+        )
+    except Exception as e:
+        logger.error(f"LLM API call failed: {e}")
+        raise
     return resp.choices[0].message.content or ""
 
 
@@ -67,12 +74,16 @@ async def chat_completion_json(messages: list[dict], model: str | None = None, r
     if system_parts and not merged:
         merged.append({"role": "user", "content": "\n\n".join(system_parts)})
 
-    resp = await client.chat.completions.create(
-        model=model,
-        messages=merged,
-        temperature=1.0,
-        max_completion_tokens=4096,
-    )
+    try:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=merged,
+            temperature=1.0,
+            max_completion_tokens=4096,
+        )
+    except Exception as e:
+        logger.error(f"LLM API call failed: {e}")
+        raise
     text = resp.choices[0].message.content or "{}"
     result = _extract_json(text)
     if return_raw:

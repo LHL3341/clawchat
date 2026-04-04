@@ -14,6 +14,9 @@ from services.llm import get_model, chat_completion, chat_completion_json
 from services.helpers import is_bot, get_existing_handoffs, format_recent_history, handle_reply_with_handoff
 import json
 import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -335,8 +338,9 @@ async def websocket_endpoint(websocket: WebSocket, conversation_id: str, token: 
     if token:
         try:
             decode_token(token)
-        except Exception:
-            await websocket.close(code=4001, reason="Invalid token")
+        except Exception as e:
+            logger.warning(f"WebSocket auth failed: {e}")
+            await websocket.close(code=1008)
             return
     await websocket.accept()
     if conversation_id not in active_connections:
@@ -395,9 +399,12 @@ async def websocket_endpoint(websocket: WebSocket, conversation_id: str, token: 
                             reply_text = await generate_agent_reply(responder, listener, history, existing_handoffs=ws_existing_handoffs, host_knowledge_context=ws_hk_ctx, model=responder.preferred_model or None)
                             await handle_reply_with_handoff(db, conversation_id, responder_id, payload["sender_id"], reply_text, ws_used_model)
     except WebSocketDisconnect:
-        active_connections[conversation_id].remove(websocket)
-        if not active_connections[conversation_id]:
-            del active_connections[conversation_id]
+        try:
+            active_connections[conversation_id].remove(websocket)
+            if not active_connections[conversation_id]:
+                del active_connections[conversation_id]
+        except (ValueError, KeyError):
+            pass
 
 
 @router.get("/unread/{shrimp_id}")

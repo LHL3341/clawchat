@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone, timedelta
-from sqlalchemy import String, Integer, Float, Boolean, Text, JSON, ForeignKey
+from sqlalchemy import String, Integer, Float, Boolean, Text, JSON, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from database import Base
 import enum
@@ -58,8 +58,8 @@ class Conversation(Base):
     __tablename__ = "conversations"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=gen_uuid)
-    shrimp_a_id: Mapped[str] = mapped_column(ForeignKey("shrimps.id"))
-    shrimp_b_id: Mapped[str] = mapped_column(ForeignKey("shrimps.id"))
+    shrimp_a_id: Mapped[str] = mapped_column(ForeignKey("shrimps.id"), index=True)
+    shrimp_b_id: Mapped[str] = mapped_column(ForeignKey("shrimps.id"), index=True)
     affinity_a: Mapped[float] = mapped_column(Float, default=50.0)
     affinity_b: Mapped[float] = mapped_column(Float, default=50.0)
     status: Mapped[str] = mapped_column(String(20), default=ConversationStatus.active.value)
@@ -76,12 +76,12 @@ class Message(Base):
     __tablename__ = "messages"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=gen_uuid)
-    conversation_id: Mapped[str] = mapped_column(ForeignKey("conversations.id"))
-    sender_id: Mapped[str] = mapped_column(ForeignKey("shrimps.id"))
+    conversation_id: Mapped[str] = mapped_column(ForeignKey("conversations.id"), index=True)
+    sender_id: Mapped[str] = mapped_column(ForeignKey("shrimps.id"), index=True)
     content: Mapped[str] = mapped_column(Text)
     sender_type: Mapped[str] = mapped_column(String(20), default=SenderType.agent.value)
     model_used: Mapped[str] = mapped_column(String(100), default="")
-    created_at: Mapped[datetime] = mapped_column(default=now_beijing)
+    created_at: Mapped[datetime] = mapped_column(default=now_beijing, index=True)
 
     conversation: Mapped["Conversation"] = relationship("Conversation", back_populates="messages")
     sender: Mapped["Shrimp"] = relationship("Shrimp")
@@ -90,6 +90,7 @@ class Message(Base):
 class ReadPointer(Base):
     """Tracks the last read message for each user in each conversation."""
     __tablename__ = "read_pointers"
+    __table_args__ = (UniqueConstraint('shrimp_id', 'conversation_id', name='uq_read_pointer'),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=gen_uuid)
     shrimp_id: Mapped[str] = mapped_column(ForeignKey("shrimps.id"))
@@ -104,7 +105,7 @@ class User(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=gen_uuid)
     username: Mapped[str] = mapped_column(String(50), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(128))
-    shrimp_id: Mapped[str] = mapped_column(ForeignKey("shrimps.id"))
+    shrimp_id: Mapped[str] = mapped_column(ForeignKey("shrimps.id"), index=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(default=now_beijing)
 
@@ -153,8 +154,8 @@ class Invitation(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=gen_uuid)
     conversation_id: Mapped[str] = mapped_column(ForeignKey("conversations.id"), index=True)
-    sender_id: Mapped[str] = mapped_column(ForeignKey("shrimps.id"))
-    receiver_id: Mapped[str] = mapped_column(ForeignKey("shrimps.id"))
+    sender_id: Mapped[str] = mapped_column(ForeignKey("shrimps.id"), index=True)
+    receiver_id: Mapped[str] = mapped_column(ForeignKey("shrimps.id"), index=True)
     content: Mapped[str] = mapped_column(Text)
     handoff_type: Mapped[str] = mapped_column(String(50), default="邀约")
     draft_reply: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -198,8 +199,8 @@ class DriftBottle(Base):
     status: Mapped[str] = mapped_column(String(20), default=BottleStatus.floating.value)
     pickup_count: Mapped[int] = mapped_column(Integer, default=0)
     max_pickups: Mapped[int] = mapped_column(Integer, default=3)
-    picked_by_id: Mapped[str | None] = mapped_column(ForeignKey("shrimps.id"), nullable=True)
-    conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversations.id"), nullable=True)
+    picked_by_id: Mapped[str | None] = mapped_column(ForeignKey("shrimps.id"), nullable=True, index=True)
+    conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversations.id"), nullable=True, index=True)
     expires_at: Mapped[datetime] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(default=now_beijing)
 

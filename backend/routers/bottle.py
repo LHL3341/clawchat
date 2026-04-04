@@ -122,11 +122,13 @@ async def throw_back_bottle(
 @router.post("/write")
 async def manually_write_bottle(
     shrimp_id: str = Query(...),
-    body: dict = {},
+    body: dict | None = None,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """Host manually writes a bottle."""
+    if body is None:
+        body = {}
     content = body.get("content", "").strip()
     if not content:
         raise HTTPException(400, "Content cannot be empty")
