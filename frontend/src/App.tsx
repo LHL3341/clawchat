@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { Routes, Route, Navigate, useNavigate } from 'react-router-dom';
+import { useWebSocket } from './hooks/useWebSocket';
 import { api } from './api';
 import type { Shrimp, Conversation, Message, HeartbeatLog, Invitation, ScheduleItem, DriftBottle } from './types';
 import LoginPage from './pages/LoginPage';
@@ -95,7 +96,6 @@ function ChatApp() {
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
-  const wsRef = useRef<WebSocket | null>(null);
 
   // Init: get current user from JWT
   useEffect(() => {
@@ -183,31 +183,31 @@ function ChatApp() {
     });
   }, [activeConvId, myId]);
 
-  // WebSocket
+  // WebSocket with auto-reconnect
+  const wsUrl = activeConvId
+    ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/api/chat/ws/${activeConvId}${localStorage.getItem('jwt_token') ? `?token=${localStorage.getItem('jwt_token')}` : ''}`
+    : null;
+
+  const { status: wsStatus } = useWebSocket(wsUrl, (payload: any) => {
+    if (payload.type === 'message') {
+      setMessages(prev => prev.some(m => m.id === payload.data.id) ? prev : [...prev, payload.data]);
+      setLastMsgs(prev => ({ ...prev, [activeConvId!]: payload.data }));
+      // Auto mark read since user is viewing this conversation
+      if (myId) api.markRead(activeConvId!, myId);
+    } else if (payload.type === 'affinity_update') {
+      setConvs(prev => prev.map(c => c.id === activeConvId ? { ...c, ...payload.data } : c));
+    } else if (payload.type === 'invitation') {
+      setInvitations(prev => prev.some(inv => inv.id === payload.data.id) ? prev : [...prev, payload.data]);
+    } else if (payload.type === 'invitation_update') {
+      setInvitations(prev => prev.map(inv => inv.id === payload.data.id ? payload.data : inv));
+    }
+  });
+
+  // Fallback polling for messages
   useEffect(() => {
     if (!activeConvId) return;
-    wsRef.current?.close();
-    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    const token = localStorage.getItem('jwt_token');
-    const ws = new WebSocket(`${proto}://${window.location.host}/api/chat/ws/${activeConvId}${token ? `?token=${token}` : ''}`);
-    wsRef.current = ws;
-    ws.onmessage = (e) => {
-      const payload = JSON.parse(e.data);
-      if (payload.type === 'message') {
-        setMessages(prev => prev.some(m => m.id === payload.data.id) ? prev : [...prev, payload.data]);
-        setLastMsgs(prev => ({ ...prev, [activeConvId]: payload.data }));
-        // Auto mark read since user is viewing this conversation
-        if (myId) api.markRead(activeConvId, myId);
-      } else if (payload.type === 'affinity_update') {
-        setConvs(prev => prev.map(c => c.id === activeConvId ? { ...c, ...payload.data } : c));
-      } else if (payload.type === 'invitation') {
-        setInvitations(prev => prev.some(inv => inv.id === payload.data.id) ? prev : [...prev, payload.data]);
-      } else if (payload.type === 'invitation_update') {
-        setInvitations(prev => prev.map(inv => inv.id === payload.data.id ? payload.data : inv));
-      }
-    };
     const poll = setInterval(() => { api.getMessages(activeConvId).then(setMessages); }, 15000);
-    return () => { ws.close(); clearInterval(poll); };
+    return () => clearInterval(poll);
   }, [activeConvId]);
 
   // Only auto-scroll if user is already near the bottom
