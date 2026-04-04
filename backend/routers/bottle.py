@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
+from sqlalchemy.orm import selectinload
 from database import get_db
 from models import DriftBottle, BottleStatus, Shrimp, Conversation, Message, SenderType, now_beijing
 from schemas import DriftBottleOut
@@ -29,14 +30,11 @@ async def get_picked_bottles(
     result = await db.execute(
         select(DriftBottle).where(
             and_(DriftBottle.picked_by_id == shrimp_id, DriftBottle.status == BottleStatus.picked_up.value)
-        ).order_by(DriftBottle.created_at.desc())
+        ).options(selectinload(DriftBottle.author))
+        .order_by(DriftBottle.created_at.desc())
     )
     bottles = list(result.scalars().all())
-    out = []
-    for b in bottles:
-        author = await db.get(Shrimp, b.author_id)
-        out.append(_bottle_to_out(b, author))
-    return out
+    return [_bottle_to_out(b, b.author) for b in bottles]
 
 
 @router.get("/my-bottles", response_model=list[DriftBottleOut])

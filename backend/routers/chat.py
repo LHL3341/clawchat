@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, or_
+from sqlalchemy import select, and_, or_, func
 from sqlalchemy.orm import selectinload
 from database import get_db, async_session
 from models import Conversation, Message, Shrimp, SenderType, ConversationStatus, ReadPointer, User, Invitation, now_beijing
@@ -61,16 +61,32 @@ async def list_conversations(shrimp_id: str, db: AsyncSession = Depends(get_db))
     user_result = await db.execute(select(User.shrimp_id).where(User.shrimp_id.in_(all_shrimp_ids)))
     real_user_shrimp_ids = {row[0] for row in user_result.all()}
 
+    # Bulk fetch last message per conversation
+    conv_ids = [c.id for c in convs]
+    if conv_ids:
+        latest_sub = (
+            select(Message.conversation_id, func.max(Message.created_at).label("max_ca"))
+            .where(Message.conversation_id.in_(conv_ids))
+            .group_by(Message.conversation_id)
+            .subquery()
+        )
+        last_msgs_result = await db.execute(
+            select(Message).join(
+                latest_sub,
+                and_(
+                    Message.conversation_id == latest_sub.c.conversation_id,
+                    Message.created_at == latest_sub.c.max_ca,
+                ),
+            )
+        )
+        last_msg_map = {m.conversation_id: m for m in last_msgs_result.scalars().all()}
+    else:
+        last_msg_map = {}
+
     # Attach last_message for each conversation
     out = []
     for conv in convs:
-        msg_result = await db.execute(
-            select(Message)
-            .where(Message.conversation_id == conv.id)
-            .order_by(Message.created_at.desc())
-            .limit(1)
-        )
-        last_msg = msg_result.scalar_one_or_none()
+        last_msg = last_msg_map.get(conv.id)
         conv_dict = ConversationOut.model_validate(conv).model_dump()
         if conv_dict.get("shrimp_a"):
             conv_dict["shrimp_a"]["is_bot"] = conv.shrimp_a_id not in real_user_shrimp_ids
@@ -395,23 +411,29 @@ async def get_unread_counts(shrimp_id: str, db: AsyncSession = Depends(get_db)):
     )
     convs = result.scalars().all()
 
+    # Bulk fetch all read pointers for this shrimp
+    rp_result = await db.execute(
+        select(ReadPointer).where(ReadPointer.shrimp_id == shrimp_id)
+    )
+    pointer_map = {rp.conversation_id: rp for rp in rp_result.scalars().all()}
+
+    # Bulk fetch last-read messages to get their timestamps
+    read_msg_ids = [rp.last_read_msg_id for rp in pointer_map.values() if rp.last_read_msg_id]
+    if read_msg_ids:
+        read_msgs_result = await db.execute(select(Message).where(Message.id.in_(read_msg_ids)))
+        read_msg_map = {m.id: m for m in read_msgs_result.scalars().all()}
+    else:
+        read_msg_map = {}
+
+    # Count unread per conversation
     unread = {}
     for conv in convs:
-        # Get read pointer
-        rp_result = await db.execute(
-            select(ReadPointer).where(
-                and_(ReadPointer.shrimp_id == shrimp_id, ReadPointer.conversation_id == conv.id)
-            )
-        )
-        pointer = rp_result.scalar_one_or_none()
-
-        # Count messages after the pointer
+        pointer = pointer_map.get(conv.id)
         if pointer and pointer.last_read_msg_id:
-            # Get the timestamp of the last read message
-            last_read = await db.get(Message, pointer.last_read_msg_id)
+            last_read = read_msg_map.get(pointer.last_read_msg_id)
             if last_read:
                 count_result = await db.execute(
-                    select(Message).where(
+                    select(func.count(Message.id)).where(
                         and_(
                             Message.conversation_id == conv.id,
                             Message.created_at > last_read.created_at,
@@ -420,13 +442,12 @@ async def get_unread_counts(shrimp_id: str, db: AsyncSession = Depends(get_db)):
                         )
                     )
                 )
-                unread[conv.id] = len(count_result.scalars().all())
+                unread[conv.id] = count_result.scalar() or 0
             else:
                 unread[conv.id] = 0
         else:
-            # No pointer = all non-self messages are unread
             count_result = await db.execute(
-                select(Message).where(
+                select(func.count(Message.id)).where(
                     and_(
                         Message.conversation_id == conv.id,
                         Message.sender_id != shrimp_id,
@@ -434,7 +455,7 @@ async def get_unread_counts(shrimp_id: str, db: AsyncSession = Depends(get_db)):
                     )
                 )
             )
-            unread[conv.id] = len(count_result.scalars().all())
+            unread[conv.id] = count_result.scalar() or 0
 
     return unread
 
@@ -671,13 +692,14 @@ async def get_schedule(
                 or_(Invitation.sender_id == shrimp_id, Invitation.receiver_id == shrimp_id),
                 Invitation.status == "accepted",
             )
-        ).order_by(Invitation.resolved_at.desc())
+        ).options(selectinload(Invitation.sender), selectinload(Invitation.receiver))
+        .order_by(Invitation.resolved_at.desc())
     )
     invs = list(result.scalars().all())
     out = []
     for inv in invs:
-        sender = await db.get(Shrimp, inv.sender_id)
-        receiver = await db.get(Shrimp, inv.receiver_id)
+        sender = inv.sender
+        receiver = inv.receiver
         item = ScheduleItemOut.model_validate(inv).model_dump()
         item["sender_name"] = sender.name if sender else ""
         item["sender_emoji"] = sender.avatar_emoji if sender else "🦐"
