@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, or_
+from sqlalchemy import select, and_, or_, func
 from sqlalchemy.orm import selectinload
 from database import get_db, async_session
 from models import Conversation, Message, Shrimp, SenderType, ConversationStatus, ReadPointer, User, Invitation, now_beijing
@@ -11,8 +11,12 @@ from services.agent_chat import generate_agent_reply, generate_opening, parse_ha
 from services.affinity import evaluate_affinity
 from services.host_knowledge import get_host_knowledge, format_host_knowledge_context
 from services.llm import get_model, chat_completion, chat_completion_json
+from services.helpers import is_bot, get_existing_handoffs, format_recent_history, handle_reply_with_handoff
 import json
 import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -60,16 +64,32 @@ async def list_conversations(shrimp_id: str, db: AsyncSession = Depends(get_db))
     user_result = await db.execute(select(User.shrimp_id).where(User.shrimp_id.in_(all_shrimp_ids)))
     real_user_shrimp_ids = {row[0] for row in user_result.all()}
 
+    # Bulk fetch last message per conversation
+    conv_ids = [c.id for c in convs]
+    if conv_ids:
+        latest_sub = (
+            select(Message.conversation_id, func.max(Message.created_at).label("max_ca"))
+            .where(Message.conversation_id.in_(conv_ids))
+            .group_by(Message.conversation_id)
+            .subquery()
+        )
+        last_msgs_result = await db.execute(
+            select(Message).join(
+                latest_sub,
+                and_(
+                    Message.conversation_id == latest_sub.c.conversation_id,
+                    Message.created_at == latest_sub.c.max_ca,
+                ),
+            )
+        )
+        last_msg_map = {m.conversation_id: m for m in last_msgs_result.scalars().all()}
+    else:
+        last_msg_map = {}
+
     # Attach last_message for each conversation
     out = []
     for conv in convs:
-        msg_result = await db.execute(
-            select(Message)
-            .where(Message.conversation_id == conv.id)
-            .order_by(Message.created_at.desc())
-            .limit(1)
-        )
-        last_msg = msg_result.scalar_one_or_none()
+        last_msg = last_msg_map.get(conv.id)
         conv_dict = ConversationOut.model_validate(conv).model_dump()
         if conv_dict.get("shrimp_a"):
             conv_dict["shrimp_a"]["is_bot"] = conv.shrimp_a_id not in real_user_shrimp_ids
@@ -129,8 +149,7 @@ async def send_message(
     elif data.sender_type == "human":
         # Human mode: if the OTHER shrimp is a test bot (no user account), auto-reply
         other_id = conv.shrimp_b_id if sender_id == conv.shrimp_a_id else conv.shrimp_a_id
-        is_bot = (await db.execute(select(User).where(User.shrimp_id == other_id))).scalar_one_or_none() is None
-        if is_bot:
+        if await is_bot(db, other_id):
             asyncio.create_task(_auto_reply_bot(conversation_id, other_id))
 
     return msg
@@ -168,55 +187,13 @@ async def _auto_reply_bot(conversation_id: str, responder_id: str):
             instructions = [m.content for m in history if m.sender_type == SenderType.instruction.value and m.sender_id == responder_id]
 
             # Load existing handoffs to avoid repeats
-            inv_result = await db.execute(
-                select(Invitation).where(Invitation.conversation_id == conversation_id)
-            )
-            existing_handoffs = [
-                f"[{inv.handoff_type}] {inv.content}" for inv in inv_result.scalars().all()
-            ] or None
+            existing_handoffs = await get_existing_handoffs(db, conversation_id)
 
             hk = await get_host_knowledge(db, responder_id)
             hk_ctx = format_host_knowledge_context(hk)
             used_model = get_model(speaker.preferred_model or None)
             reply_text = await generate_agent_reply(speaker, listener, history, instructions[-3:] if instructions else None, existing_handoffs=existing_handoffs, host_knowledge_context=hk_ctx, model=speaker.preferred_model or None)
-            reply_text, handoff_type, handoff_desc = parse_handoff_tag(reply_text)
-
-            is_bot_sender = (await db.execute(select(User).where(User.shrimp_id == responder_id))).scalar_one_or_none() is None
-
-            if handoff_type and not is_bot_sender:
-                # Real user's shrimp triggered HANDOFF — block reply, store as draft for host
-                inv = Invitation(
-                    sender_id=responder_id,
-                    receiver_id=listener_id,
-                    conversation_id=conversation_id,
-                    content=handoff_desc or handoff_type,
-                    handoff_type=handoff_type,
-                    draft_reply=reply_text,
-                )
-                db.add(inv)
-                await db.commit()
-                await db.refresh(inv)
-                await broadcast(conversation_id, {
-                    "type": "invitation",
-                    "data": InvitationOut.model_validate(inv).model_dump(mode="json"),
-                })
-            else:
-                # Bot triggered HANDOFF — ignore it (the other side's shrimp will detect it)
-                # Or no HANDOFF — send reply normally
-                reply = Message(
-                    conversation_id=conversation_id,
-                    sender_id=responder_id,
-                    content=reply_text,
-                    sender_type=SenderType.agent.value,
-                    model_used=used_model,
-                )
-                db.add(reply)
-                await db.commit()
-                await db.refresh(reply)
-                await broadcast(conversation_id, {
-                    "type": "message",
-                    "data": MessageOut.model_validate(reply).model_dump(mode="json"),
-                })
+            await handle_reply_with_handoff(db, conversation_id, responder_id, listener_id, reply_text, used_model)
     except Exception as e:
         import logging
         logging.getLogger("chat").error(f"Bot auto-reply error: {e}")
@@ -279,12 +256,7 @@ async def trigger_agent_reply(
     ]
 
     # Load existing handoffs to avoid repeats
-    inv_result = await db.execute(
-        select(Invitation).where(Invitation.conversation_id == conversation_id)
-    )
-    existing_handoffs = [
-        f"[{inv.handoff_type}] {inv.content}" for inv in inv_result.scalars().all()
-    ] or None
+    existing_handoffs = await get_existing_handoffs(db, conversation_id)
 
     hk = await get_host_knowledge(db, speaker.id)
     hk_ctx = format_host_knowledge_context(hk)
@@ -322,8 +294,7 @@ async def trigger_agent_reply(
 
     # Create handoff event only if sender has a real host
     if handoff_type:
-        is_bot_sender = (await db.execute(select(User).where(User.shrimp_id == responder_id))).scalar_one_or_none() is None
-        if not is_bot_sender:
+        if not await is_bot(db, responder_id):
             # Real user's shrimp triggered HANDOFF — pending for host
             inv = Invitation(
                 conversation_id=conversation_id,
@@ -367,8 +338,9 @@ async def websocket_endpoint(websocket: WebSocket, conversation_id: str, token: 
     if token:
         try:
             decode_token(token)
-        except Exception:
-            await websocket.close(code=4001, reason="Invalid token")
+        except Exception as e:
+            logger.warning(f"WebSocket auth failed: {e}")
+            await websocket.close(code=1008)
             return
     await websocket.accept()
     if conversation_id not in active_connections:
@@ -420,58 +392,19 @@ async def websocket_endpoint(websocket: WebSocket, conversation_id: str, token: 
                                 select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at)
                             )
                             history = list(result.scalars().all())
-                            # Load existing handoffs to avoid repeats
-                            inv_result = await db.execute(
-                                select(Invitation).where(Invitation.conversation_id == conversation_id)
-                            )
-                            ws_existing_handoffs = [
-                                f"[{inv.handoff_type}] {inv.content}" for inv in inv_result.scalars().all()
-                            ] or None
+                            ws_existing_handoffs = await get_existing_handoffs(db, conversation_id)
                             ws_hk = await get_host_knowledge(db, responder_id)
                             ws_hk_ctx = format_host_knowledge_context(ws_hk)
                             ws_used_model = get_model(responder.preferred_model or None)
                             reply_text = await generate_agent_reply(responder, listener, history, existing_handoffs=ws_existing_handoffs, host_knowledge_context=ws_hk_ctx, model=responder.preferred_model or None)
-                            reply_text, ws_handoff_type, ws_handoff_desc = parse_handoff_tag(reply_text)
-
-                            ws_is_bot_sender = (await db.execute(select(User).where(User.shrimp_id == responder_id))).scalar_one_or_none() is None
-
-                            if ws_handoff_type and not ws_is_bot_sender:
-                                # Block reply, store draft for host
-                                ws_inv = Invitation(
-                                    sender_id=responder_id,
-                                    receiver_id=payload["sender_id"],
-                                    conversation_id=conversation_id,
-                                    content=ws_handoff_desc or ws_handoff_type,
-                                    handoff_type=ws_handoff_type,
-                                    draft_reply=reply_text,
-                                )
-                                db.add(ws_inv)
-                                await db.commit()
-                                await db.refresh(ws_inv)
-                                await broadcast(conversation_id, {
-                                    "type": "invitation",
-                                    "data": InvitationOut.model_validate(ws_inv).model_dump(mode="json"),
-                                })
-                            else:
-                                # Bot sender: ignore HANDOFF (other side will detect), send reply normally
-                                reply = Message(
-                                    conversation_id=conversation_id,
-                                    sender_id=responder_id,
-                                    content=reply_text,
-                                    sender_type=SenderType.agent.value,
-                                    model_used=ws_used_model,
-                                )
-                                db.add(reply)
-                                await db.commit()
-                                await db.refresh(reply)
-                                await broadcast(conversation_id, {
-                                    "type": "message",
-                                    "data": MessageOut.model_validate(reply).model_dump(mode="json"),
-                                })
+                            await handle_reply_with_handoff(db, conversation_id, responder_id, payload["sender_id"], reply_text, ws_used_model)
     except WebSocketDisconnect:
-        active_connections[conversation_id].remove(websocket)
-        if not active_connections[conversation_id]:
-            del active_connections[conversation_id]
+        try:
+            active_connections[conversation_id].remove(websocket)
+            if not active_connections[conversation_id]:
+                del active_connections[conversation_id]
+        except (ValueError, KeyError):
+            pass
 
 
 @router.get("/unread/{shrimp_id}")
@@ -485,23 +418,29 @@ async def get_unread_counts(shrimp_id: str, db: AsyncSession = Depends(get_db)):
     )
     convs = result.scalars().all()
 
+    # Bulk fetch all read pointers for this shrimp
+    rp_result = await db.execute(
+        select(ReadPointer).where(ReadPointer.shrimp_id == shrimp_id)
+    )
+    pointer_map = {rp.conversation_id: rp for rp in rp_result.scalars().all()}
+
+    # Bulk fetch last-read messages to get their timestamps
+    read_msg_ids = [rp.last_read_msg_id for rp in pointer_map.values() if rp.last_read_msg_id]
+    if read_msg_ids:
+        read_msgs_result = await db.execute(select(Message).where(Message.id.in_(read_msg_ids)))
+        read_msg_map = {m.id: m for m in read_msgs_result.scalars().all()}
+    else:
+        read_msg_map = {}
+
+    # Count unread per conversation
     unread = {}
     for conv in convs:
-        # Get read pointer
-        rp_result = await db.execute(
-            select(ReadPointer).where(
-                and_(ReadPointer.shrimp_id == shrimp_id, ReadPointer.conversation_id == conv.id)
-            )
-        )
-        pointer = rp_result.scalar_one_or_none()
-
-        # Count messages after the pointer
+        pointer = pointer_map.get(conv.id)
         if pointer and pointer.last_read_msg_id:
-            # Get the timestamp of the last read message
-            last_read = await db.get(Message, pointer.last_read_msg_id)
+            last_read = read_msg_map.get(pointer.last_read_msg_id)
             if last_read:
                 count_result = await db.execute(
-                    select(Message).where(
+                    select(func.count(Message.id)).where(
                         and_(
                             Message.conversation_id == conv.id,
                             Message.created_at > last_read.created_at,
@@ -510,13 +449,12 @@ async def get_unread_counts(shrimp_id: str, db: AsyncSession = Depends(get_db)):
                         )
                     )
                 )
-                unread[conv.id] = len(count_result.scalars().all())
+                unread[conv.id] = count_result.scalar() or 0
             else:
                 unread[conv.id] = 0
         else:
-            # No pointer = all non-self messages are unread
             count_result = await db.execute(
-                select(Message).where(
+                select(func.count(Message.id)).where(
                     and_(
                         Message.conversation_id == conv.id,
                         Message.sender_id != shrimp_id,
@@ -524,7 +462,7 @@ async def get_unread_counts(shrimp_id: str, db: AsyncSession = Depends(get_db)):
                     )
                 )
             )
-            unread[conv.id] = len(count_result.scalars().all())
+            unread[conv.id] = count_result.scalar() or 0
 
     return unread
 
@@ -639,10 +577,7 @@ async def polish_message(
         .order_by(Message.created_at.desc()).limit(5)
     )
     recent = list(reversed(list(result.scalars().all())))
-    history_text = "\n".join(
-        f"{'我' if m.sender_id == sender_id else listener.name}: {m.content}"
-        for m in recent if m.sender_type != "instruction"
-    )
+    history_text = format_recent_history(recent, sender_id, listener.name)
 
     from prompts.profile import build_shrimp_profile
     system = (
@@ -681,10 +616,7 @@ async def suggest_replies(
         .order_by(Message.created_at.desc()).limit(6)
     )
     recent = list(reversed(list(result.scalars().all())))
-    history_text = "\n".join(
-        f"{'我' if m.sender_id == sender_id else listener.name}: {m.content}"
-        for m in recent if m.sender_type != "instruction"
-    )
+    history_text = format_recent_history(recent, sender_id, listener.name)
 
     from prompts.profile import build_shrimp_profile
     system = (
@@ -767,13 +699,14 @@ async def get_schedule(
                 or_(Invitation.sender_id == shrimp_id, Invitation.receiver_id == shrimp_id),
                 Invitation.status == "accepted",
             )
-        ).order_by(Invitation.resolved_at.desc())
+        ).options(selectinload(Invitation.sender), selectinload(Invitation.receiver))
+        .order_by(Invitation.resolved_at.desc())
     )
     invs = list(result.scalars().all())
     out = []
     for inv in invs:
-        sender = await db.get(Shrimp, inv.sender_id)
-        receiver = await db.get(Shrimp, inv.receiver_id)
+        sender = inv.sender
+        receiver = inv.receiver
         item = ScheduleItemOut.model_validate(inv).model_dump()
         item["sender_name"] = sender.name if sender else ""
         item["sender_emoji"] = sender.avatar_emoji if sender else "🦐"
@@ -827,10 +760,7 @@ async def accept_invitation(inv_id: str, body: dict = None, db: AsyncSession = D
             .order_by(Message.created_at.desc()).limit(5)
         )
         recent = list(reversed(list(result.scalars().all())))
-        history_text = "\n".join(
-            f"{'我' if m.sender_id == inv.sender_id else (listener.name if listener else '对方')}: {m.content}"
-            for m in recent if m.sender_type != "instruction"
-        )
+        history_text = format_recent_history(recent, inv.sender_id, listener.name if listener else '对方')
         from prompts.profile import build_shrimp_profile
         polish_system = (
             f"你是「{sender.name}」的语言润色助手。\n"

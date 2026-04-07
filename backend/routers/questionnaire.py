@@ -143,9 +143,18 @@ async def get_friend_memories(
         select(AgentMemory).where(AgentMemory.shrimp_id == user.shrimp_id)
     )
     memories = result.scalars().all()
+
+    # Bulk fetch all target shrimps to avoid N+1 queries
+    target_ids = {mem.target_id for mem in memories}
+    if target_ids:
+        shrimp_result = await db.execute(select(Shrimp).where(Shrimp.id.in_(target_ids)))
+        shrimp_map = {s.id: s for s in shrimp_result.scalars().all()}
+    else:
+        shrimp_map = {}
+
     items = []
     for mem in memories:
-        target = await db.get(Shrimp, mem.target_id)
+        target = shrimp_map.get(mem.target_id)
         content = json.loads(mem.content) if isinstance(mem.content, str) else mem.content
         if not content:
             continue

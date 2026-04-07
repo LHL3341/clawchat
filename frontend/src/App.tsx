@@ -1,7 +1,8 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { Routes, Route, Navigate, useNavigate } from 'react-router-dom';
+import { useWebSocket } from './hooks/useWebSocket';
 import { api } from './api';
-import type { Shrimp, Conversation, Message, HeartbeatLog, Invitation, ScheduleItem } from './types';
+import type { Shrimp, Conversation, Message, HeartbeatLog, Invitation, ScheduleItem, DriftBottle } from './types';
 import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/RegisterPage';
 import ShrimpRadar from './components/ShrimpRadar';
@@ -86,8 +87,8 @@ function ChatApp() {
   const [inviteContent, setInviteContent] = useState('');
   const [schedule, setSchedule] = useState<ScheduleItem[]>([]);
   const [globalMatching, setGlobalMatching] = useState(false);
-  const [pickedBottles, setPickedBottles] = useState<import('./types').DriftBottle[]>([]);
-  const [myBottles, setMyBottles] = useState<import('./types').DriftBottle[]>([]);
+  const [pickedBottles, setPickedBottles] = useState<DriftBottle[]>([]);
+  const [myBottles, setMyBottles] = useState<DriftBottle[]>([]);
   const [bottleReply, setBottleReply] = useState<Record<string, string>>({});
   const [bottleContent, setBottleContent] = useState('');
   const [writingBottle, setWritingBottle] = useState(false);
@@ -95,7 +96,6 @@ function ChatApp() {
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
-  const wsRef = useRef<WebSocket | null>(null);
 
   // Init: get current user from JWT
   useEffect(() => {
@@ -149,6 +149,8 @@ function ChatApp() {
   }, [navigate]);
 
   // Poll conversations
+  const activeConvIdRef = useRef(activeConvId);
+  activeConvIdRef.current = activeConvId;
   const loadConvs = useCallback(async () => {
     if (!myId) return;
     const list = await api.listConversations(myId);
@@ -162,8 +164,8 @@ function ChatApp() {
     // Load unread counts
     const counts = await api.getUnreadCounts(myId);
     setUnread(counts);
-    if (!activeConvId && list.length > 0) setActiveConvId(list[0].id);
-  }, [myId, activeConvId]);
+    if (!activeConvIdRef.current && list.length > 0) setActiveConvId(list[0].id);
+  }, [myId]);
 
   useEffect(() => {
     loadConvs();
@@ -181,31 +183,31 @@ function ChatApp() {
     });
   }, [activeConvId, myId]);
 
-  // WebSocket
+  // WebSocket with auto-reconnect
+  const wsUrl = activeConvId
+    ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/api/chat/ws/${activeConvId}${localStorage.getItem('jwt_token') ? `?token=${localStorage.getItem('jwt_token')}` : ''}`
+    : null;
+
+  const { status: wsStatus } = useWebSocket(wsUrl, (payload: any) => {
+    if (payload.type === 'message') {
+      setMessages(prev => prev.some(m => m.id === payload.data.id) ? prev : [...prev, payload.data]);
+      setLastMsgs(prev => ({ ...prev, [activeConvId!]: payload.data }));
+      // Auto mark read since user is viewing this conversation
+      if (myId) api.markRead(activeConvId!, myId);
+    } else if (payload.type === 'affinity_update') {
+      setConvs(prev => prev.map(c => c.id === activeConvId ? { ...c, ...payload.data } : c));
+    } else if (payload.type === 'invitation') {
+      setInvitations(prev => prev.some(inv => inv.id === payload.data.id) ? prev : [...prev, payload.data]);
+    } else if (payload.type === 'invitation_update') {
+      setInvitations(prev => prev.map(inv => inv.id === payload.data.id ? payload.data : inv));
+    }
+  });
+
+  // Fallback polling for messages
   useEffect(() => {
     if (!activeConvId) return;
-    wsRef.current?.close();
-    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    const token = localStorage.getItem('jwt_token');
-    const ws = new WebSocket(`${proto}://${window.location.host}/api/chat/ws/${activeConvId}${token ? `?token=${token}` : ''}`);
-    wsRef.current = ws;
-    ws.onmessage = (e) => {
-      const payload = JSON.parse(e.data);
-      if (payload.type === 'message') {
-        setMessages(prev => prev.some(m => m.id === payload.data.id) ? prev : [...prev, payload.data]);
-        setLastMsgs(prev => ({ ...prev, [activeConvId]: payload.data }));
-        // Auto mark read since user is viewing this conversation
-        if (myId) api.markRead(activeConvId, myId);
-      } else if (payload.type === 'affinity_update') {
-        setConvs(prev => prev.map(c => c.id === activeConvId ? { ...c, ...payload.data } : c));
-      } else if (payload.type === 'invitation') {
-        setInvitations(prev => prev.some(inv => inv.id === payload.data.id) ? prev : [...prev, payload.data]);
-      } else if (payload.type === 'invitation_update') {
-        setInvitations(prev => prev.map(inv => inv.id === payload.data.id ? payload.data : inv));
-      }
-    };
     const poll = setInterval(() => { api.getMessages(activeConvId).then(setMessages); }, 15000);
-    return () => { ws.close(); clearInterval(poll); };
+    return () => clearInterval(poll);
   }, [activeConvId]);
 
   // Only auto-scroll if user is already near the bottom
@@ -886,7 +888,7 @@ function ChatApp() {
                       const model = e.target.value;
                       if (myId) {
                         try {
-                          const updated = await api.updateShrimp(myId, { preferred_model: model } as any);
+                          const updated = await api.updateShrimp(myId, { preferred_model: model });
                           setMe(prev => prev ? { ...prev, preferred_model: model } : prev);
                         } catch {}
                       }

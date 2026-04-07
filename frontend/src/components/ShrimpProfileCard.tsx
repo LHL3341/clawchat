@@ -18,16 +18,17 @@ function getMatchColor(score: number) {
 }
 
 function getSharedInterests(a: string[], b: string[]): { shared: string[]; unique: string[] } {
-  const setB = new Set(b.map(s => s.toLowerCase()))
-  const shared: string[] = []
-  const unique: string[] = []
+  const setB = new Set(b.map(s => s.toLowerCase()));
+  const setA = new Set(a.map(s => s.toLowerCase()));
+  const shared: string[] = [];
+  const unique: string[] = [];
   for (const i of a) {
-    if (setB.has(i.toLowerCase())) shared.push(i)
+    if (setB.has(i.toLowerCase())) shared.push(i);
   }
   for (const i of b) {
-    if (!new Set(a.map(s => s.toLowerCase())).has(i.toLowerCase())) unique.push(i)
+    if (!setA.has(i.toLowerCase())) unique.push(i);
   }
-  return { shared, unique }
+  return { shared, unique };
 }
 
 export default function ShrimpProfileCard({

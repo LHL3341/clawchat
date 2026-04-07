@@ -117,3 +117,17 @@ export interface DriftBottle {
   author_name?: string;
   author_emoji?: string;
 }
+
+// Heartbeat log detail types
+export interface LlmLog {
+  input: unknown;
+  output: unknown;
+}
+
+export interface ChatHeartbeatAction {
+  action: 'reply' | 'follow_up' | 'skip' | 'error';
+  other: string;
+  hint?: string;
+  llm_decide?: LlmLog;
+  llm_reply?: LlmLog;
+}
